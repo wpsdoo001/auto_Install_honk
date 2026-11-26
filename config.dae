@@ -1,0 +1,184 @@
+
+global {
+
+    lan_interface: enp1s0
+    wan_interface: auto
+    auto_config_kernel_parameter: true
+    log_level: info
+    dial_mode: domain
+    sniffing_timeout: 50ms
+    tls_implementation: utls
+    utls_imitate: chrome_auto
+    allow_insecure: false
+
+    ##### 自身与兜底 DNS（只用于解析订阅域名/节点域名，不参与分流）
+    bootstrap_resolver: '223.5.5.5:53'
+    fallback_resolver: '8.8.8.8:53'
+
+    ##### 节点连通性测速
+    tcp_check_url: http://cp.cloudflare.com, 1.1.1.1
+    tcp_check_http_method: HEAD
+    udp_check_dns: dns.google:53, 8.8.8.8
+    check_interval: 300s
+    check_tolerance: 500ms
+    data_dir: '/etc/honk'
+}
+
+subscription {
+    sub: {
+        url: 'https://page.atom002.ccwu.cc/sub?token=9bd830ad41e4c25c540e840bde9e93c7'
+        interval: 24h
+        route: direct
+    }
+
+}
+
+group {
+    Final {
+        filter: !name(regex: '官网|剩余|流量|套餐|免费|订阅|到期|Expire|Traffic|ExpireDate|过期|重置|公告|通知|群|测试订阅')
+        filter: subtag(sub)
+        policy: score
+        interrupt_connections: true
+    }
+
+    # ---- 默认代理：优先香港 ----
+    Proxy {
+        filter: name(keyword: '排除|官网|剩余|流量|到期')
+        filter: subtag(sub)
+        policy: min_moving_avg
+        interrupt_connections: true
+    }
+
+    # ---- Google 系：香港出口，延迟低 ----
+    Google {
+        filter: !name(regex: '排除|官网|剩余|流量|到期')
+        filter: subtag(sub)
+        policy: min_moving_avg
+    }
+
+    YouTube {
+        filter: name(regex: '排除|官网|剩余|流量|到期')
+        filter: subtag(sub)
+        policy: roundrobin
+        final: Final
+    }
+
+    # ---- AI：美国原生 IP 最稳，避免"地区不支持" ----
+    AI {
+        filter: name(regex: '🇺🇸|美国|United States|UnitedStates|US') && !name(regex: '排除|官网|剩余|流量|到期')
+        filter: name(regex: '(?i)(?:^|[^a-z0-9])jp(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])jpn(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])japan(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])tokyo(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])osaka(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])nrt(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])hnd(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])kix(?:[^a-z0-9]|$)|日本|東京|东京|大阪|🇯🇵')
+        filter: name(regex: '(?i)(?:^|[^a-z0-9])sg(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])sgp(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])singapore(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])sin(?:[^a-z0-9]|$)|新加坡|獅城|狮城|🇸🇬')
+        policy: select
+    }
+
+    # ---- 即时通讯 ----
+    Telegram {
+        filter: name(regex: '🇭🇰|🇸🇬|香港|新加坡|Singapore|HongKong|HK|SG') && !name(regex: '排除|官网|剩余|流量|到期')
+        filter: name(regex: '(?i)(?:^|[^a-z0-9])sg(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])sgp(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])singapore(?:[^a-z0-9]|$)|(?:^|[^a-z0-9])sin(?:[^a-z0-9]|$)|新加坡|獅城|狮城|🇸🇬')
+        policy: min_moving_avg
+    }
+
+    # ---- 开发与微软 ----
+    GitHub {
+        filter: name(regex: '🇯🇵|🇸🇬|日本|新加坡|Japan|Singapore|JP|SG') && !name(regex: '排除|官网|剩余|流量|到期')
+        policy: min_moving_avg
+    }
+
+    Microsoft {
+        filter: name(regex: '🇯🇵|🇸🇬|日本|新加坡|Japan|Singapore|JP|SG') && !name(regex: '排除|官网|剩余|流量|到期')
+        policy: min_moving_avg
+    }
+
+    OneDrive {
+        filter: name(regex: '🇯🇵|🇸🇬|日本|新加坡|Japan|Singapore|JP|SG') && !name(regex: '排除|官网|剩余|流量|到期')
+        policy: min_moving_avg
+    }
+
+    Apple {
+        filter: name(regex: '🇭🇰|🇯🇵|香港|日本|HongKong|HK|JP') && !name(regex: '排除|官网|剩余|流量|到期')
+        policy: min_moving_avg
+        final: direct
+    }
+      
+    # ---- 游戏 ----
+    Steam {
+        filter: name(regex: '🇭🇰|香港|HongKong|HK|日本') && !name(regex: '排除|官网|剩余|流量|到期')
+        policy: min_moving_avg
+    }
+}
+
+dns {
+    upstream {
+        remote: 'https://8.8.8.8/dns-query' ->Final
+        local: 'https://dns.alidns.com/dns-query'
+    }
+
+    routing {
+
+        request {
+            qname(geosite:category-ads-all) -> reject
+            qtype(https, svcb) -> reject
+            qname(suffix: googleapis.cn, suffix: xn--ngstr-lra8j.com) -> remote
+            qname(geosite:cn, geosite:microsoft@cn, geosite:apple@cn, geosite:private) -> local
+            qname(geosite:geolocation-!cn) -> remote
+            fallback: remote
+        }
+
+        response {
+            upstream(remote) && ip(geoip:cn) -> local
+            fallback: accept
+        }
+    }
+}
+
+
+routing {
+    pname(NetworkManager, systemd-resolved, systemd-networkd) -> direct
+    # 广播 / 组播 / 局域网私有地址，不能被代理抓走
+    dip(224.0.0.0/3, 'ff00::/8') -> direct
+    dip(geoip:private) -> direct
+
+    dport(853) -> block
+    l4proto(udp) && dport(443) -> block
+    ##### 三、广告 / 跟踪
+    domain(geosite:category-ads-all) -> block
+
+    domain(suffix: googleapis.cn, suffix: xn--ngstr-lra8j.com) -> Google
+    domain(suffix: withgoogle.com, suffix: notebooklm.google, geosite: 'category-ai-!cn') -> AI
+    domain(geosite:youtube) -> YouTube
+    domain(geosite:google) -> Google
+    domain(geosite:github) -> GitHub
+    domain(geosite:telegram) -> Telegram
+
+    # 微软系：国内版直连，国际版走代理
+    domain(geosite:microsoft@cn) -> direct
+    domain(geosite:onedrive) -> OneDrive
+    domain(geosite:microsoft) -> Microsoft
+    # 苹果系同上
+    domain(geosite:apple@cn) -> direct
+    domain(geosite:apple) -> Apple
+    # Steam：国区直连，商店/社区走代理
+    domain(geosite:steam@cn) -> direct
+    domain(geosite:steam) -> Steam
+    domain(geosite:cn) -> direct
+    domain(geosite:private) -> direct
+    dip(geoip:cn) -> direct
+    domain(geosite:geolocation-!cn) -> Proxy
+    fallback: Final
+}
+
+ experimental {
+     native_api {
+         enabled: true
+         listen: '0.0.0.0:9527'
+         password_auth: true
+         config_write: true
+         ui: embedded
+     }
+     cache_file {
+         enabled: true
+         store_dns: true
+     }
+ }
+
+
