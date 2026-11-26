@@ -1,7 +1,7 @@
 
 global {
 
-    lan_interface: enp1s0
+    lan_interface: ##选择自己的网口
     wan_interface: auto
     auto_config_kernel_parameter: true
     log_level: info
@@ -26,7 +26,7 @@ global {
 
 subscription {
     sub: {
-        url: 'https://page.atom002.ccwu.cc/sub?token=9bd830ad41e4c25c540e840bde9e93c7'
+        url: ''
         interval: 24h
         route: direct
     }
@@ -35,7 +35,7 @@ subscription {
 
 group {
     Final {
-        filter: !name(regex: '官网|剩余|流量|套餐|免费|订阅|到期|Expire|Traffic|ExpireDate|过期|重置|公告|通知|群|测试订阅')
+        filter: !name(regex: '官网|剩余|流量|套餐|免费|订阅|到期')
         filter: subtag(sub)
         policy: score
         interrupt_connections: true
