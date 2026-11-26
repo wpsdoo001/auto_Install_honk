@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Honk (daeuniverse/honk) Docker 一键部署、更新与卸载管理脚本（修复优化版）
+# Honk (daeuniverse/honk) Docker 一键部署、更新与卸载管理脚本（修复拉取与网络容错版）
 
 set -e
 
@@ -16,13 +16,15 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 PLAIN="\033[0m"
 
-# 全局常量配置
+# 全局常量与可覆盖环境变量
 CONTAINER_NAME="honk"
-IMAGE_REPO="ghcr.io/daeuniverse/honk"
+IMAGE_REPO="${HONK_IMAGE:-ghcr.io/daeuniverse/honk}"
+DEFAULT_FALLBACK_VER="${HONK_VERSION:-0.1.0-beta.7}"
 CONFIG_DIR="/etc/honk"
 WEB_BIND="0.0.0.0:9527"
-GITHUB_API="https://api.github.com/repos/daeuniverse/honk/releases/latest"
+GITHUB_API="https://api.github.com/repos/daeuniverse/honk/releases"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELECTED_IFACE=""
 
 # 检查 Root 权限
 check_root() {
@@ -67,7 +69,6 @@ clean_iptables_rules() {
 fix_direct_traffic() {
     echo -e "${CYAN}[网络修复] 正在配置宿主机内核参数与防火墙规则，彻底消除直连丢包...${PLAIN}"
 
-    # 1. 开启 IP 转发并关闭反向路径过滤 (rp_filter)
     cat > /etc/sysctl.d/99-honk.conf <<EOF
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
@@ -80,7 +81,6 @@ EOF
     fi
     sysctl -p /etc/sysctl.d/99-honk.conf >/dev/null 2>&1 || true
 
-    # 2. 放行 iptables FORWARD 链（幂等，不会重复添加）
     if [[ -n "$SELECTED_IFACE" ]]; then
         iptables -C FORWARD -i "$SELECTED_IFACE" -j ACCEPT 2>/dev/null \
             || iptables -I FORWARD 1 -i "$SELECTED_IFACE" -j ACCEPT 2>/dev/null || true
@@ -88,7 +88,6 @@ EOF
             || iptables -I FORWARD 1 -o "$SELECTED_IFACE" -j ACCEPT 2>/dev/null || true
     fi
 
-    # 3. 确保宿主机挂载了 bpffs
     if ! mount | grep -q "/sys/fs/bpf"; then
         mount -t bpf bpffs /sys/fs/bpf 2>/dev/null || true
     fi
@@ -100,7 +99,6 @@ EOF
 clean_network_rules() {
     local iface="${1:-}"
 
-    # 优先使用传入的网卡，否则读取配置文件记录的网卡
     if [[ -z "$iface" && -f "${CONFIG_DIR}/.iface" ]]; then
         iface=$(cat "${CONFIG_DIR}/.iface" 2>/dev/null || true)
     fi
@@ -157,7 +155,7 @@ select_interface() {
     echo -e "${GREEN}[已选择] 绑定 LAN 网卡接口: ${SELECTED_IFACE}${PLAIN}"
 }
 
-# 配置文件处理（严格 Shell 语法分支）
+# 配置文件处理
 handle_config() {
     mkdir -p "$CONFIG_DIR"
 
@@ -245,19 +243,27 @@ EOF
     echo "$SELECTED_IFACE" > "${CONFIG_DIR}/.iface"
 }
 
-# 获取远程最新版本号
+# 获取远程最新版本号（包含 prerelease 回退到已知可用版本）
 get_latest_version() {
+    if [[ -n "${HONK_VERSION:-}" ]]; then
+        LATEST_VER="${HONK_VERSION#v}"
+        echo -e "${CYAN}[版本] 使用指定版本标签: ${LATEST_VER}${PLAIN}"
+        return 0
+    fi
+
     LATEST_VER=""
     local resp=""
-    resp=$(curl -sL --connect-timeout 10 "$GITHUB_API" 2>/dev/null || true)
-
+    # 先查 releases 列表首条（含 beta/pre-release），再查 latest
+    resp=$(curl -fsSL --connect-timeout 8 --max-time 15 "${GITHUB_API}?per_page=1" 2>/dev/null || true)
     if [[ -n "$resp" ]]; then
-        LATEST_VER=$(printf '%s\n' "$resp" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' | head -n1 || true)
+        LATEST_VER=$(printf '%s\n' "$resp" | grep -m1 '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/' || true)
     fi
 
     if [[ -z "$LATEST_VER" ]]; then
-        echo -e "${YELLOW}[提示] 无法获取远程最新版本，将使用 latest 标签。${PLAIN}"
-        LATEST_VER="latest"
+        echo -e "${YELLOW}[提示] 无法通过 GitHub API 获取版本列表，回退使用版本标签: ${DEFAULT_FALLBACK_VER}${PLAIN}"
+        LATEST_VER="$DEFAULT_FALLBACK_VER"
+    else
+        echo -e "${GREEN}[版本] 检测到远程最新版本标签: ${LATEST_VER}${PLAIN}"
     fi
 }
 
@@ -271,15 +277,44 @@ get_current_version() {
     fi
 }
 
+# 诊断并尝试拉取镜像
+pull_image_with_diagnostics() {
+    local target_image="${IMAGE_REPO}:${1}"
+    echo -e "${CYAN}[部署] 正在拉取镜像 ${target_image} ...${PLAIN}"
+
+    if docker pull "$target_image"; then
+        return 0
+    fi
+
+    # 若非默认回退版本且拉取失败，尝试回退版本一次
+    if [[ "$1" != "$DEFAULT_FALLBACK_VER" ]]; then
+        local fallback_image="${IMAGE_REPO}:${DEFAULT_FALLBACK_VER}"
+        echo -e "${YELLOW}[重试] 标签 ${1} 拉取失败，尝试回退标签 ${fallback_image} ...${PLAIN}"
+        if docker pull "$fallback_image"; then
+            LATEST_VER="$DEFAULT_FALLBACK_VER"
+            return 0
+        fi
+    fi
+
+    echo -e "${RED}[失败] 镜像拉取失败（当前仓库: ${IMAGE_REPO}）。${PLAIN}"
+    echo -e "${YELLOW}[排查建议]${PLAIN}"
+    echo -e "  1. 测试宿主机到 ghcr.io 的连通性：curl -I --connect-timeout 8 https://ghcr.io"
+    echo -e "  2. 检查 Docker 守护进程代理或镜像加速配置（注意终端代理变量不会自动传给 dockerd）"
+    echo -e "  3. 指定可用镜像代理或版本号重跑："
+    echo -e "     HONK_IMAGE=你的镜像代理/daeuniverse/honk HONK_VERSION=${DEFAULT_FALLBACK_VER} bash $0"
+    echo -e "  4. 若当前环境无法直连外网，可在有网机器执行 docker pull ${target_image} 后 docker save/load 导入"
+    return 1
+}
+
 # 启动容器
 run_container() {
     local TAG="$1"
 
-    echo -e "${CYAN}[部署] 正在拉取镜像 ${IMAGE_REPO}:${TAG} ...${PLAIN}"
-    if ! docker pull "${IMAGE_REPO}:${TAG}"; then
-        echo -e "${RED}[失败] 镜像 ${IMAGE_REPO}:${TAG} 拉取失败，请检查网络或镜像源。${PLAIN}"
+    if ! pull_image_with_diagnostics "$TAG"; then
         exit 1
     fi
+
+    TAG="$LATEST_VER"
 
     if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
@@ -307,6 +342,7 @@ run_container() {
         echo -e "=================================================="
         echo -e "${GREEN}[成功] Honk 已成功部署并运行！${PLAIN}"
         echo -e "  当前安装版本 : ${CYAN}${INSTALLED_VER}${PLAIN}"
+        echo -e "  使用镜像仓库 : ${CYAN}${IMAGE_REPO}:${TAG}${PLAIN}"
         echo -e "  绑定 LAN 网卡: ${CYAN}${SELECTED_IFACE}${PLAIN}"
         echo -e "  Web 管理地址 : ${CYAN}http://${WEB_BIND}${PLAIN}"
         echo -e "  配置文件路径 : ${CYAN}${CONFIG_DIR}/config.dae${PLAIN}"
@@ -348,7 +384,7 @@ update_honk() {
     get_current_version
     get_latest_version
     echo -e "  当前版本 : ${YELLOW}${CURRENT_VER}${PLAIN}"
-    echo -e "  最新版本 : ${GREEN}${LATEST_VER}${PLAIN}"
+    echo -e "  目标版本 : ${GREEN}${LATEST_VER}${PLAIN}"
 
     if ! read -rp "是否开始更新 Honk 镜像？(Y/n): " do_up; then
         echo -e "${RED}[错误] 读取输入失败，退出。${PLAIN}"
@@ -377,7 +413,6 @@ uninstall_honk() {
     fi
     [[ ! "$confirm" =~ ^[Yy]$ ]] && return 0
 
-    # 先读取记录网卡，用于后续 iptables 清理
     local saved_iface=""
     if [[ -f "${CONFIG_DIR}/.iface" ]]; then
         saved_iface=$(cat "${CONFIG_DIR}/.iface" 2>/dev/null || true)
@@ -435,6 +470,7 @@ show_menu() {
     echo -e "       ${CYAN}Honk (daeuniverse/honk) 增强管理脚本${PLAIN}"
     echo -e "=================================================="
     echo -e " 运行状态: ${GREEN}${CURRENT_VER}${PLAIN} | 管理面板: ${CYAN}0.0.0.0:9527${PLAIN}"
+    echo -e " 镜像仓库: ${CYAN}${IMAGE_REPO}${PLAIN}"
     echo -e "--------------------------------------------------"
     echo -e "  ${GREEN}1.${PLAIN} 安装 Honk (优先复制同级 config.dae 或自动生成模板)"
     echo -e "  ${GREEN}2.${PLAIN} 更新 Honk (平滑升级最新镜像)"
